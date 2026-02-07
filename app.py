@@ -1,7 +1,8 @@
 """Soccer Match Analysis -- Streamlit Application.
 
-Upload a short soccer clip and analyze it using SAM 3 to track players,
-the ball, compute ball speed, and highlight individual players.
+Upload a short soccer clip and analyze it using YOLOv8 + ByteTrack
+to track players and the ball, compute ball speed, and highlight
+individual players.
 
 Run with: streamlit run app.py
 """
@@ -11,7 +12,6 @@ from __future__ import annotations
 import os
 
 import streamlit as st
-import numpy as np
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -24,7 +24,7 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Imports (lazy, so the page loads fast even if SAM 3 isn't installed yet)
+# Imports
 # ---------------------------------------------------------------------------
 
 from utils.video import (
@@ -64,21 +64,18 @@ _init_state()
 # ---------------------------------------------------------------------------
 st.sidebar.title("⚽ Match Analysis Config")
 
-st.sidebar.header("Team Prompts")
-st.sidebar.caption(
-    "Describe each team's jersey so SAM 3 can distinguish them. "
-    "Be specific (e.g. 'player in white jersey with blue shorts')."
+st.sidebar.header("Detection Settings")
+model_choice = st.sidebar.selectbox(
+    "YOLO Model",
+    ["yolov8n.pt (fast)", "yolov8s.pt (balanced)", "yolov8m.pt (accurate)"],
+    index=0,
 )
-team_a_prompt = st.sidebar.text_input(
-    "Team A prompt", value="player in white jersey"
-)
-team_b_prompt = st.sidebar.text_input(
-    "Team B prompt", value="player in red jersey"
-)
+model_name = model_choice.split(" ")[0]
+
+confidence = st.sidebar.slider("Detection confidence", 0.1, 0.9, 0.3, 0.05)
 
 st.sidebar.header("Ball Tracking")
 track_ball = st.sidebar.checkbox("Track the ball", value=True)
-ball_prompt = st.sidebar.text_input("Ball prompt", value="soccer ball")
 
 st.sidebar.header("Display Options")
 show_trails = st.sidebar.checkbox("Show movement trails", value=True)
@@ -108,8 +105,8 @@ if calibration_mode == "Manual (known distance)":
 # ---------------------------------------------------------------------------
 st.title("⚽ Soccer Match Analyzer")
 st.markdown(
-    "Upload a short soccer clip and let **SAM 3** track every player, "
-    "the ball, and compute ball speed -- all from text prompts."
+    "Upload a short soccer clip and let **YOLOv8 + ByteTrack** track every player "
+    "and the ball, compute ball speed, and highlight individual players."
 )
 
 # ---------------------------------------------------------------------------
@@ -158,7 +155,7 @@ if st.session_state["video_path"] is not None:
         st.session_state["annotated_video_path"] = None
         st.session_state["highlighted_player_id"] = None
 
-        progress = st.progress(0, text="Initializing SAM 3...")
+        progress = st.progress(0, text="Initializing YOLOv8...")
         status_text = st.empty()
 
         def update_status(msg: str):
@@ -166,16 +163,16 @@ if st.session_state["video_path"] is not None:
 
         try:
             # -- Track players and ball --
-            progress.progress(10, text="Loading SAM 3 model...")
-            tracker = SoccerTracker()
+            progress.progress(10, text="Loading YOLOv8 model...")
+            tracker = SoccerTracker(
+                model_name=model_name,
+                confidence=confidence,
+            )
 
-            progress.progress(20, text="Running object detection...")
+            progress.progress(20, text="Running detection and tracking...")
             tracking_result: TrackingResult = tracker.analyze(
                 video_path=video_path,
-                team_a_prompt=team_a_prompt,
-                team_b_prompt=team_b_prompt,
                 track_ball=track_ball,
-                ball_prompt=ball_prompt,
                 fps=meta.fps,
                 progress_callback=update_status,
             )
@@ -238,14 +235,12 @@ if st.session_state["analysis_done"]:
     speed_analysis: SpeedAnalysis | None = st.session_state["speed_analysis"]
 
     # -- Summary metrics --
-    team_a = tracking_result.get_objects_by_label("team_a")
-    team_b = tracking_result.get_objects_by_label("team_b")
+    players = tracking_result.get_objects_by_label("player")
     ball = tracking_result.get_ball()
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Team A Players Detected", len(team_a))
-    col2.metric("Team B Players Detected", len(team_b))
-    col3.metric("Ball Detected", "Yes" if ball else "No")
+    col1, col2 = st.columns(2)
+    col1.metric("Players Detected", len(players))
+    col2.metric("Ball Detected", "Yes" if ball else "No")
 
     # -- Annotated video --
     st.subheader("Annotated Video")
@@ -284,7 +279,7 @@ if st.session_state["analysis_done"]:
     player_ids = tracking_result.get_player_ids()
     if player_ids:
         player_options = {
-            pid: f"Player #{pid} ({tracking_result.get_object_by_id(pid).label.replace('_', ' ').title()})"
+            pid: f"Player #{pid}"
             for pid in player_ids
         }
 
@@ -332,7 +327,7 @@ if st.session_state["analysis_done"]:
             frames_detected = len(obj.boxes)
             pct = (frames_detected / tracking_result.total_frames * 100) if tracking_result.total_frames > 0 else 0
             st.write(
-                f"**{obj.label.replace('_', ' ').title()}** #{obj.object_id} "
+                f"**{obj.label.title()}** #{obj.object_id} "
                 f"-- Detected in {frames_detected}/{tracking_result.total_frames} frames "
                 f"({pct:.0f}%)"
             )
@@ -342,6 +337,6 @@ if st.session_state["analysis_done"]:
 # ---------------------------------------------------------------------------
 st.divider()
 st.caption(
-    "Built with SAM 3 (Meta) | Streamlit | OpenCV | "
+    "Built with YOLOv8 + ByteTrack | Streamlit | OpenCV | "
     "Columbia DevPost Hackathon 2026"
 )

@@ -135,7 +135,7 @@ def frames_to_video(
     frames: list[np.ndarray],
     output_path: str,
     fps: float,
-    codec: str = "mp4v",
+    codec: str = "avc1",
 ) -> str:
     """Write a list of frames to a video file.
 
@@ -143,7 +143,7 @@ def frames_to_video(
         frames: List of BGR numpy arrays (all same size).
         output_path: Path for the output video file.
         fps: Frames per second for the output video.
-        codec: FourCC codec string (default "mp4v" for .mp4 files).
+        codec: FourCC codec string (default "avc1" for H.264 MP4 files).
 
     Returns:
         The output path.
@@ -154,6 +154,11 @@ def frames_to_video(
     h, w = frames[0].shape[:2]
     fourcc = cv2.VideoWriter_fourcc(*codec)
     writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+
+    if not writer.isOpened():
+        # Fallback to mp4v if avc1 fails
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
 
     try:
         for frame in frames:

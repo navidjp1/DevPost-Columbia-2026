@@ -1,7 +1,8 @@
-"""SAM 3 video tracking wrapper for soccer match analysis.
+"""YOLOv8 + ByteTrack video tracking for soccer match analysis.
 
-Wraps the SAM 3 Video Predictor API to track players and ball
-using text prompts across video frames.
+Uses YOLOv8 for per-frame object detection (players and ball)
+and ByteTrack (via supervision) for consistent ID tracking across frames.
+Works on CPU, MPS (Apple Silicon), and CUDA.
 """
 
 from __future__ import annotations
@@ -10,10 +11,16 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+import cv2
 import numpy as np
-import torch
+import supervision as sv
+from ultralytics import YOLO
 
 logger = logging.getLogger(__name__)
+
+# COCO class IDs used by YOLOv8
+PERSON_CLASS_ID = 0
+SPORTS_BALL_CLASS_ID = 32
 
 
 @dataclass
@@ -21,8 +28,7 @@ class TrackedObject:
     """Represents a single tracked object across all frames."""
 
     object_id: int
-    label: str  # e.g. "team_a", "team_b", "ball"
-    prompt: str  # the text prompt used to detect this object
+    label: str  # "player" or "ball"
     # Per-frame data: frame_index -> data
     masks: dict[int, np.ndarray] = field(default_factory=dict)
     boxes: dict[int, np.ndarray] = field(default_factory=dict)  # [x1, y1, x2, y2]
@@ -72,316 +78,80 @@ class TrackingResult:
         return [
             obj.object_id
             for obj in self.objects
-            if obj.label in ("team_a", "team_b")
+            if obj.label == "player"
         ]
 
 
 class SoccerTracker:
-    """High-level tracker that uses SAM 3 to track players and ball in soccer video.
+    """High-level tracker using YOLOv8 + ByteTrack to track players and ball.
 
     Usage:
         tracker = SoccerTracker()
         result = tracker.analyze(
             video_path="clip.mp4",
-            team_a_prompt="player in white jersey",
-            team_b_prompt="player in red jersey",
             track_ball=True,
         )
     """
 
-    def __init__(self, device: str | None = None):
+    def __init__(
+        self,
+        model_name: str = "yolov8n.pt",
+        device: str | None = None,
+        confidence: float = 0.3,
+    ):
         """Initialize the tracker.
 
         Args:
-            device: Torch device string. If None, auto-detects GPU.
+            model_name: YOLOv8 model name/path. Options:
+                        "yolov8n.pt" (nano, fastest),
+                        "yolov8s.pt" (small),
+                        "yolov8m.pt" (medium, most accurate).
+            device: Device string ("cpu", "mps", "cuda"). Auto-detected if None.
+            confidence: Minimum detection confidence threshold (0-1).
         """
-        self._predictor = None
-        self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self._model_name = model_name
+        self._model: YOLO | None = None
+        self._device = device  # None means YOLO auto-detects
+        self._confidence = confidence
 
-    def _load_predictor(self):
-        """Lazily load the SAM 3 video predictor."""
-        if self._predictor is not None:
+    def _load_model(self):
+        """Lazily load the YOLO model."""
+        if self._model is not None:
             return
 
-        logger.info("Loading SAM 3 video predictor...")
-        from sam3.model_builder import build_sam3_video_predictor
-
-        self._predictor = build_sam3_video_predictor()
-        logger.info("SAM 3 video predictor loaded successfully.")
+        logger.info(f"Loading YOLOv8 model: {self._model_name}")
+        self._model = YOLO(self._model_name)
+        logger.info("YOLOv8 model loaded successfully.")
 
     def analyze(
         self,
         video_path: str,
-        team_a_prompt: str = "player in white jersey",
-        team_b_prompt: str = "player in red jersey",
         track_ball: bool = True,
-        ball_prompt: str = "soccer ball",
-        prompt_frame: int = 0,
         fps: float | None = None,
+        confidence: float | None = None,
         progress_callback: Any | None = None,
     ) -> TrackingResult:
         """Run full tracking analysis on a soccer video clip.
 
         Args:
-            video_path: Path to the video file (MP4) or JPEG frame directory.
-            team_a_prompt: Text prompt for team A players.
-            team_b_prompt: Text prompt for team B players.
+            video_path: Path to the video file (MP4, AVI, etc.).
             track_ball: Whether to track the ball.
-            ball_prompt: Text prompt for the ball.
-            prompt_frame: Frame index to use for initial detection.
             fps: Video FPS (auto-detected from video if None).
+            confidence: Override detection confidence for this run.
             progress_callback: Optional callable(status_str) for progress updates.
 
         Returns:
-            TrackingResult with all tracked objects and their per-frame data.
+            TrackingResult with all tracked objects and per-frame data.
         """
-        import cv2
+        self._load_model()
 
-        self._load_predictor()
+        conf = confidence if confidence is not None else self._confidence
 
-        # Get video metadata if fps not provided
-        if fps is None:
-            cap = cv2.VideoCapture(video_path)
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            cap.release()
-        else:
-            cap = cv2.VideoCapture(video_path)
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            cap.release()
-
-        if progress_callback:
-            progress_callback("Starting SAM 3 session...")
-
-        # Start a video session
-        response = self._predictor.handle_request(
-            request=dict(
-                type="start_session",
-                resource_path=video_path,
-            )
-        )
-        session_id = response["session_id"]
-
-        try:
-            tracked_objects: list[TrackedObject] = []
-            object_id_counter = 0
-
-            # Build list of prompts to process
-            prompts = [
-                (team_a_prompt, "team_a"),
-                (team_b_prompt, "team_b"),
-            ]
-            if track_ball:
-                prompts.append((ball_prompt, "ball"))
-
-            # Add prompts for each category
-            for prompt_text, label in prompts:
-                if progress_callback:
-                    progress_callback(f"Detecting: {prompt_text}...")
-
-                resp = self._predictor.handle_request(
-                    request=dict(
-                        type="add_prompt",
-                        session_id=session_id,
-                        frame_index=prompt_frame,
-                        text=prompt_text,
-                    )
-                )
-
-                outputs = resp.get("outputs", {})
-                masks = outputs.get("masks")
-                boxes = outputs.get("boxes")
-                scores = outputs.get("scores")
-
-                if masks is None or boxes is None:
-                    logger.warning(
-                        f"No detections for prompt '{prompt_text}' on frame {prompt_frame}"
-                    )
-                    continue
-
-                # Convert to numpy if needed
-                if isinstance(masks, torch.Tensor):
-                    masks = masks.cpu().numpy()
-                if isinstance(boxes, torch.Tensor):
-                    boxes = boxes.cpu().numpy()
-                if isinstance(scores, torch.Tensor):
-                    scores = scores.cpu().numpy()
-
-                # Create TrackedObject for each detected instance
-                num_instances = len(boxes) if hasattr(boxes, '__len__') else 0
-                for i in range(num_instances):
-                    obj = TrackedObject(
-                        object_id=object_id_counter,
-                        label=label,
-                        prompt=prompt_text,
-                    )
-                    if masks is not None and i < len(masks):
-                        obj.masks[prompt_frame] = (
-                            masks[i] if masks.ndim > 2 else masks
-                        )
-                    if boxes is not None and i < len(boxes):
-                        obj.boxes[prompt_frame] = np.array(boxes[i])
-                    if scores is not None and i < len(scores):
-                        obj.scores[prompt_frame] = float(scores[i])
-
-                    tracked_objects.append(obj)
-                    object_id_counter += 1
-
-            # Propagate tracking to all frames
-            if progress_callback:
-                progress_callback("Propagating tracking across all frames...")
-
-            frame_indices = list(range(total_frames))
-            if frame_indices:
-                propagation_resp = self._predictor.handle_request(
-                    request=dict(
-                        type="get_outputs",
-                        session_id=session_id,
-                        frame_indices=frame_indices,
-                    )
-                )
-
-                # Parse propagation outputs and assign to tracked objects
-                self._parse_propagation_outputs(
-                    propagation_resp, tracked_objects, frame_indices
-                )
-
-            if progress_callback:
-                progress_callback("Tracking complete!")
-
-            return TrackingResult(
-                objects=tracked_objects,
-                total_frames=total_frames,
-                fps=fps,
-                width=width,
-                height=height,
-            )
-
-        finally:
-            # Always clean up the session
-            try:
-                self._predictor.handle_request(
-                    request=dict(
-                        type="end_session",
-                        session_id=session_id,
-                    )
-                )
-            except Exception as e:
-                logger.warning(f"Error ending SAM 3 session: {e}")
-
-    def _parse_propagation_outputs(
-        self,
-        response: dict,
-        tracked_objects: list[TrackedObject],
-        frame_indices: list[int],
-    ):
-        """Parse propagation response and update tracked objects with per-frame data.
-
-        The exact response format depends on the SAM 3 version. This method
-        handles the common output structure where outputs contain masks, boxes,
-        and scores indexed by frame.
-        """
-        outputs = response.get("outputs", response)
-
-        # Handle different possible output formats from SAM 3
-        # Format 1: outputs is a dict with frame_index keys
-        if isinstance(outputs, dict):
-            for frame_idx in frame_indices:
-                frame_key = frame_idx
-                if frame_key not in outputs and str(frame_key) in outputs:
-                    frame_key = str(frame_key)
-                if frame_key not in outputs:
-                    continue
-
-                frame_data = outputs[frame_key]
-                masks = frame_data.get("masks")
-                boxes = frame_data.get("boxes")
-                scores = frame_data.get("scores")
-
-                if isinstance(masks, torch.Tensor):
-                    masks = masks.cpu().numpy()
-                if isinstance(boxes, torch.Tensor):
-                    boxes = boxes.cpu().numpy()
-                if isinstance(scores, torch.Tensor):
-                    scores = scores.cpu().numpy()
-
-                if boxes is not None:
-                    for i, obj in enumerate(tracked_objects):
-                        if i < len(boxes):
-                            obj.boxes[frame_idx] = np.array(boxes[i])
-                        if masks is not None and i < len(masks):
-                            obj.masks[frame_idx] = (
-                                masks[i] if masks.ndim > 2 else masks
-                            )
-                        if scores is not None and i < len(scores):
-                            obj.scores[frame_idx] = float(scores[i])
-
-        # Format 2: outputs is a list indexed by frame
-        elif isinstance(outputs, (list, tuple)):
-            for idx, frame_idx in enumerate(frame_indices):
-                if idx >= len(outputs):
-                    break
-                frame_data = outputs[idx]
-                if not isinstance(frame_data, dict):
-                    continue
-
-                masks = frame_data.get("masks")
-                boxes = frame_data.get("boxes")
-                scores = frame_data.get("scores")
-
-                if isinstance(masks, torch.Tensor):
-                    masks = masks.cpu().numpy()
-                if isinstance(boxes, torch.Tensor):
-                    boxes = boxes.cpu().numpy()
-                if isinstance(scores, torch.Tensor):
-                    scores = scores.cpu().numpy()
-
-                if boxes is not None:
-                    for i, obj in enumerate(tracked_objects):
-                        if i < len(boxes):
-                            obj.boxes[frame_idx] = np.array(boxes[i])
-                        if masks is not None and i < len(masks):
-                            obj.masks[frame_idx] = (
-                                masks[i] if masks.ndim > 2 else masks
-                            )
-                        if scores is not None and i < len(scores):
-                            obj.scores[frame_idx] = float(scores[i])
-
-    def track_single_player(
-        self,
-        video_path: str,
-        frame_index: int,
-        point: tuple[int, int] | None = None,
-        box: list[int] | None = None,
-        text: str | None = None,
-        fps: float | None = None,
-        progress_callback: Any | None = None,
-    ) -> TrackingResult:
-        """Track a single player using a visual or text prompt.
-
-        Provide exactly one of: point, box, or text.
-
-        Args:
-            video_path: Path to the video file.
-            frame_index: Frame to place the prompt on.
-            point: (x, y) pixel coordinate to click on the player.
-            box: [x1, y1, x2, y2] bounding box around the player.
-            text: Text description of the player.
-            fps: Video FPS (auto-detected if None).
-            progress_callback: Optional callable(status_str).
-
-        Returns:
-            TrackingResult with a single tracked object.
-        """
-        import cv2
-
-        self._load_predictor()
-
+        # ---- Read video metadata ----
         cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {video_path}")
+
         detected_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -391,95 +161,155 @@ class SoccerTracker:
         fps = fps or detected_fps
 
         if progress_callback:
-            progress_callback("Starting single-player tracking session...")
+            progress_callback("Initializing trackers...")
 
-        response = self._predictor.handle_request(
-            request=dict(
-                type="start_session",
-                resource_path=video_path,
-            )
+        # ---- Set up ByteTrack trackers ----
+        player_tracker = sv.ByteTrack(
+            track_activation_threshold=conf,
+            frame_rate=int(fps),
         )
-        session_id = response["session_id"]
+        ball_tracker = sv.ByteTrack(
+            track_activation_threshold=max(conf - 0.1, 0.1),
+            frame_rate=int(fps),
+        ) if track_ball else None
 
-        try:
-            # Build prompt request
-            prompt_request: dict[str, Any] = dict(
-                type="add_prompt",
-                session_id=session_id,
-                frame_index=frame_index,
-            )
+        # ---- Which COCO classes to detect ----
+        classes_to_detect = [PERSON_CLASS_ID]
+        if track_ball:
+            classes_to_detect.append(SPORTS_BALL_CLASS_ID)
 
-            if text is not None:
-                prompt_request["text"] = text
-            elif point is not None:
-                prompt_request["points"] = [list(point)]
-                prompt_request["labels"] = [1]  # positive label
-            elif box is not None:
-                prompt_request["box"] = box
-            else:
-                raise ValueError("Must provide one of: point, box, or text")
+        # ---- Process each frame ----
+        # Dict: tracker_id -> TrackedObject
+        tracked_map: dict[int, TrackedObject] = {}
+        # Separate namespace for ball IDs to avoid collisions
+        ball_tracked_map: dict[int, TrackedObject] = {}
 
-            if progress_callback:
-                progress_callback("Detecting player...")
+        if progress_callback:
+            progress_callback("Running detection and tracking...")
 
-            resp = self._predictor.handle_request(request=prompt_request)
+        cap = cv2.VideoCapture(video_path)
+        frame_idx = 0
 
-            outputs = resp.get("outputs", {})
-            masks = outputs.get("masks")
-            boxes = outputs.get("boxes")
-            scores = outputs.get("scores")
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-            if isinstance(masks, torch.Tensor):
-                masks = masks.cpu().numpy()
-            if isinstance(boxes, torch.Tensor):
-                boxes = boxes.cpu().numpy()
-            if isinstance(scores, torch.Tensor):
-                scores = scores.cpu().numpy()
-
-            # Take the best detection
-            obj = TrackedObject(
-                object_id=0,
-                label="highlighted_player",
-                prompt=text or (f"point({point})" if point else f"box({box})"),
-            )
-            if boxes is not None and len(boxes) > 0:
-                obj.boxes[frame_index] = np.array(boxes[0])
-            if masks is not None and len(masks) > 0:
-                obj.masks[frame_index] = masks[0] if masks.ndim > 2 else masks
-            if scores is not None and len(scores) > 0:
-                obj.scores[frame_index] = float(scores[0])
-
-            # Propagate across all frames
-            if progress_callback:
-                progress_callback("Propagating single-player tracking...")
-
-            frame_indices = list(range(total_frames))
-            propagation_resp = self._predictor.handle_request(
-                request=dict(
-                    type="get_outputs",
-                    session_id=session_id,
-                    frame_indices=frame_indices,
+            if progress_callback and frame_idx % 30 == 0:
+                pct = int(frame_idx / max(total_frames, 1) * 100)
+                progress_callback(
+                    f"Processing frame {frame_idx}/{total_frames} ({pct}%)..."
                 )
-            )
-            self._parse_propagation_outputs(
-                propagation_resp, [obj], frame_indices
-            )
 
-            if progress_callback:
-                progress_callback("Single-player tracking complete!")
-
-            return TrackingResult(
-                objects=[obj],
-                total_frames=total_frames,
-                fps=fps,
-                width=width,
-                height=height,
+            # Run YOLO detection
+            results = self._model.predict(
+                frame,
+                conf=conf,
+                classes=classes_to_detect,
+                device=self._device,
+                verbose=False,
             )
 
-        finally:
-            try:
-                self._predictor.handle_request(
-                    request=dict(type="end_session", session_id=session_id)
+            if not results or results[0].boxes is None:
+                frame_idx += 1
+                continue
+
+            result = results[0]
+            all_boxes = result.boxes.xyxy.cpu().numpy()
+            all_confs = result.boxes.conf.cpu().numpy()
+            all_classes = result.boxes.cls.cpu().numpy().astype(int)
+
+            # ---- Split detections: players vs ball ----
+            player_mask = all_classes == PERSON_CLASS_ID
+            ball_mask = all_classes == SPORTS_BALL_CLASS_ID
+
+            # -- Track players --
+            if player_mask.any():
+                player_detections = sv.Detections(
+                    xyxy=all_boxes[player_mask],
+                    confidence=all_confs[player_mask],
+                    class_id=all_classes[player_mask],
                 )
-            except Exception as e:
-                logger.warning(f"Error ending SAM 3 session: {e}")
+                tracked_players = player_tracker.update_with_detections(
+                    player_detections
+                )
+                self._update_tracked_objects(
+                    tracked_map, tracked_players, frame_idx, label="player"
+                )
+
+            # -- Track ball --
+            if track_ball and ball_tracker is not None and ball_mask.any():
+                ball_detections = sv.Detections(
+                    xyxy=all_boxes[ball_mask],
+                    confidence=all_confs[ball_mask],
+                    class_id=all_classes[ball_mask],
+                )
+                tracked_balls = ball_tracker.update_with_detections(
+                    ball_detections
+                )
+                self._update_tracked_objects(
+                    ball_tracked_map, tracked_balls, frame_idx, label="ball"
+                )
+
+            frame_idx += 1
+
+        cap.release()
+
+        if progress_callback:
+            progress_callback("Tracking complete!")
+
+        # ---- Build final object list ----
+        # Assign globally unique IDs: players first, then ball
+        all_objects: list[TrackedObject] = []
+        next_id = 0
+
+        for obj in tracked_map.values():
+            obj.object_id = next_id
+            all_objects.append(obj)
+            next_id += 1
+
+        for obj in ball_tracked_map.values():
+            obj.object_id = next_id
+            all_objects.append(obj)
+            next_id += 1
+
+        return TrackingResult(
+            objects=all_objects,
+            total_frames=frame_idx,
+            fps=fps,
+            width=width,
+            height=height,
+        )
+
+    @staticmethod
+    def _update_tracked_objects(
+        tracked_map: dict[int, TrackedObject],
+        detections: sv.Detections,
+        frame_idx: int,
+        label: str,
+    ):
+        """Update the tracked objects map with new detections for a frame.
+
+        Args:
+            tracked_map: Dict mapping tracker_id -> TrackedObject.
+            detections: Supervision Detections with tracker_id set.
+            frame_idx: Current frame index.
+            label: Label for new objects ("player" or "ball").
+        """
+        if detections.tracker_id is None:
+            return
+
+        for i, tracker_id in enumerate(detections.tracker_id):
+            tid = int(tracker_id)
+
+            if tid not in tracked_map:
+                tracked_map[tid] = TrackedObject(
+                    object_id=tid,  # temporary, reassigned later
+                    label=label,
+                )
+
+            obj = tracked_map[tid]
+            obj.boxes[frame_idx] = detections.xyxy[i].copy()
+
+            if detections.confidence is not None and i < len(detections.confidence):
+                obj.scores[frame_idx] = float(detections.confidence[i])
