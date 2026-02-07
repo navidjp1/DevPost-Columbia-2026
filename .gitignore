@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+*.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project outputs
+outputs/
+*.mp4
+*.avi
+*.mkv
+
+# Uploaded videos (keep sample clips if needed)
+uploads/
+
+# Model checkpoints (large files)
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Streamlit
+.streamlit/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# HuggingFace cache
+.cache/
