@@ -1,8 +1,8 @@
 """Soccer Match Analysis -- Streamlit Application.
 
-Upload a short soccer clip and analyze it using YOLOv8 + ByteTrack
-to track players and the ball, compute ball speed, and highlight
-individual players.
+Upload a short soccer clip and analyze it using YOLOv8/Roboflow + ByteTrack
+to track players (with automatic team classification), the ball, compute
+ball speed, and highlight individual players.
 
 Run with: streamlit run app.py
 """
@@ -64,9 +64,24 @@ _init_state()
 # ---------------------------------------------------------------------------
 st.sidebar.title("⚽ Match Analysis Config")
 
+st.sidebar.header("Roboflow Integration")
+use_roboflow = st.sidebar.checkbox(
+    "Use Roboflow football model (recommended, runs locally)", value=True
+)
+roboflow_api_key = None
+roboflow_model_id = "football-players-detection-3zvbc/11"
+if use_roboflow:
+    roboflow_api_key = st.sidebar.text_input(
+        "Roboflow API Key",
+        type="password",
+        help="Get a free API key at roboflow.com. Needed once to download the model; inference runs locally.",
+    )
+    if not roboflow_api_key:
+        st.sidebar.warning("Enter your Roboflow API key (needed once to download model weights).")
+
 st.sidebar.header("Detection Settings")
 model_choice = st.sidebar.selectbox(
-    "YOLO Model",
+    "YOLO Model (used when Roboflow is off)",
     ["yolov8n.pt (fast)", "yolov8s.pt (balanced)", "yolov8m.pt (accurate)"],
     index=0,
 )
@@ -105,8 +120,10 @@ if calibration_mode == "Manual (known distance)":
 # ---------------------------------------------------------------------------
 st.title("⚽ Soccer Match Analyzer")
 st.markdown(
-    "Upload a short soccer clip and let **YOLOv8 + ByteTrack** track every player "
-    "and the ball, compute ball speed, and highlight individual players."
+    "Upload a short soccer clip to automatically **detect and track players "
+    "by team**, track the ball, and compute ball speed. Uses a purpose-built "
+    "football detection model (runs locally) with jersey color clustering "
+    "for automatic team classification."
 )
 
 # ---------------------------------------------------------------------------
@@ -155,7 +172,7 @@ if st.session_state["video_path"] is not None:
         st.session_state["annotated_video_path"] = None
         st.session_state["highlighted_player_id"] = None
 
-        progress = st.progress(0, text="Initializing YOLOv8...")
+        progress = st.progress(0, text="Initializing...")
         status_text = st.empty()
 
         def update_status(msg: str):
@@ -163,17 +180,19 @@ if st.session_state["video_path"] is not None:
 
         try:
             # -- Track players and ball --
-            progress.progress(10, text="Loading YOLOv8 model...")
+            progress.progress(10, text="Loading detection model...")
             tracker = SoccerTracker(
                 model_name=model_name,
                 confidence=confidence,
             )
 
-            progress.progress(20, text="Running detection and tracking...")
+            progress.progress(20, text="Running detection, tracking, and team classification...")
             tracking_result: TrackingResult = tracker.analyze(
                 video_path=video_path,
                 track_ball=track_ball,
                 fps=meta.fps,
+                roboflow_api_key=roboflow_api_key if use_roboflow else None,
+                roboflow_model_id=roboflow_model_id,
                 progress_callback=update_status,
             )
             st.session_state["tracking_result"] = tracking_result
@@ -235,12 +254,14 @@ if st.session_state["analysis_done"]:
     speed_analysis: SpeedAnalysis | None = st.session_state["speed_analysis"]
 
     # -- Summary metrics --
-    players = tracking_result.get_objects_by_label("player")
+    team_a = tracking_result.get_objects_by_label("team_a")
+    team_b = tracking_result.get_objects_by_label("team_b")
     ball = tracking_result.get_ball()
 
-    col1, col2 = st.columns(2)
-    col1.metric("Players Detected", len(players))
-    col2.metric("Ball Detected", "Yes" if ball else "No")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Team A Players", len(team_a))
+    col2.metric("Team B Players", len(team_b))
+    col3.metric("Ball Detected", "Yes" if ball else "No")
 
     # -- Annotated video --
     st.subheader("Annotated Video")
@@ -279,7 +300,7 @@ if st.session_state["analysis_done"]:
     player_ids = tracking_result.get_player_ids()
     if player_ids:
         player_options = {
-            pid: f"Player #{pid}"
+            pid: f"Player #{pid} ({tracking_result.get_object_by_id(pid).label.replace('_', ' ').title()})"
             for pid in player_ids
         }
 
@@ -326,8 +347,9 @@ if st.session_state["analysis_done"]:
         for obj in tracking_result.objects:
             frames_detected = len(obj.boxes)
             pct = (frames_detected / tracking_result.total_frames * 100) if tracking_result.total_frames > 0 else 0
+            label_display = obj.label.replace("_", " ").title()
             st.write(
-                f"**{obj.label.title()}** #{obj.object_id} "
+                f"**{label_display}** #{obj.object_id} "
                 f"-- Detected in {frames_detected}/{tracking_result.total_frames} frames "
                 f"({pct:.0f}%)"
             )
@@ -337,6 +359,6 @@ if st.session_state["analysis_done"]:
 # ---------------------------------------------------------------------------
 st.divider()
 st.caption(
-    "Built with YOLOv8 + ByteTrack | Streamlit | OpenCV | "
+    "Built with Roboflow Inference (local) + ByteTrack | Streamlit | OpenCV | "
     "Columbia DevPost Hackathon 2026"
 )

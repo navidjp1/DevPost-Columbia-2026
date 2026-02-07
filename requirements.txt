@@ -4,3 +4,5 @@ opencv-python>=4.9.0
 streamlit>=1.40.0
 numpy>=1.26.0
 Pillow>=10.0.0
+inference
+scikit-learn>=1.3.0

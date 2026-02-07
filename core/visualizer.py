@@ -20,7 +20,8 @@ from core.speed import SpeedAnalysis
 
 
 # Color palette (BGR format for OpenCV)
-PLAYER_COLOR = (255, 165, 0)     # Orange for all players
+TEAM_A_COLOR = (255, 165, 0)     # Orange
+TEAM_B_COLOR = (0, 0, 255)      # Red
 BALL_COLOR = (0, 255, 0)         # Green
 HIGHLIGHT_COLOR = (0, 255, 255)  # Yellow
 TRAIL_ALPHA = 0.6
@@ -31,7 +32,8 @@ HIGHLIGHT_THICKNESS = 4
 def get_color_for_label(label: str) -> tuple[int, int, int]:
     """Get BGR color for an object label."""
     colors = {
-        "player": PLAYER_COLOR,
+        "team_a": TEAM_A_COLOR,
+        "team_b": TEAM_B_COLOR,
         "ball": BALL_COLOR,
         "highlighted_player": HIGHLIGHT_COLOR,
     }
@@ -213,8 +215,9 @@ def _build_label(obj: TrackedObject, is_highlighted: bool) -> str:
     if obj.label == "ball":
         return "Ball"
 
+    team_letter = "A" if obj.label == "team_a" else "B"
     prefix = ">>> " if is_highlighted else ""
-    return f"{prefix}#{obj.object_id}"
+    return f"{prefix}#{obj.object_id} (Team {team_letter})"
 
 
 def _draw_label(
