@@ -48,3 +48,5 @@ checkpoints/
 
 # HuggingFace cache
 .cache/
+
+football-players-detection-1/

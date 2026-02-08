@@ -1,9 +1,12 @@
-"""YOLOv8 + ByteTrack video tracking for soccer match analysis.
+"""Football match tracker -- detection, tracking, team assignment, ball possession.
 
-Uses a fine-tuned Roboflow football detection model (run locally via the
-``inference`` package) or a generic YOLOv8 fallback for per-frame object
-detection, ByteTrack for consistent ID tracking across frames, and K-Means
-jersey color clustering for automatic team classification.
+Closely follows the approach from:
+    https://github.com/zakroum-hicham/football-analysis-CV
+
+Pipeline:
+    YOLO detection → NMS → ByteTrack → Team colour KMeans → Ball-to-player
+    assignment → (optional) perspective transform via field keypoint model.
+
 Works on CPU, MPS (Apple Silicon), and CUDA.
 """
 
@@ -16,74 +19,73 @@ from typing import Any
 
 import cv2
 import numpy as np
+import pandas as pd
 import supervision as sv
 from sklearn.cluster import KMeans
 from ultralytics import YOLO
 
 logger = logging.getLogger(__name__)
 
-# COCO class IDs used by YOLOv8
-PERSON_CLASS_ID = 0
-SPORTS_BALL_CLASS_ID = 32
+# Class IDs for custom-trained model (same order as Roboflow dataset)
+CLASS_BALL = 0
+CLASS_GOALKEEPER = 1
+CLASS_PLAYER = 2
+CLASS_REFEREE = 3
 
-# Roboflow football-players-detection model class names (lowercase)
-RF_PLAYER_CLASSES = {"player", "goalkeeper"}
-RF_BALL_CLASSES = {"ball"}
-RF_REFEREE_CLASSES = {"referee"}
 
+# -----------------------------------------------------------------------
+# Data classes
+# -----------------------------------------------------------------------
 
 @dataclass
 class TrackedObject:
     """Represents a single tracked object across all frames."""
 
     object_id: int
-    label: str  # "team_a", "team_b", or "ball"
+    label: str  # "team_a", "team_b", "ball", "referee", "goalkeeper"
     # Per-frame data: frame_index -> data
-    masks: dict[int, np.ndarray] = field(default_factory=dict)
-    boxes: dict[int, np.ndarray] = field(default_factory=dict)  # [x1, y1, x2, y2]
+    boxes: dict[int, np.ndarray] = field(default_factory=dict)  # [x1,y1,x2,y2]
     scores: dict[int, float] = field(default_factory=dict)
 
     def get_centroid(self, frame_index: int) -> tuple[float, float] | None:
-        """Get the centroid (cx, cy) of this object's bounding box at a frame.
-
-        Returns None if the object was not detected in that frame.
-        """
         if frame_index not in self.boxes:
             return None
         box = self.boxes[frame_index]
-        cx = (box[0] + box[2]) / 2
-        cy = (box[1] + box[3]) / 2
-        return (float(cx), float(cy))
+        return (float((box[0] + box[2]) / 2), float((box[1] + box[3]) / 2))
+
+    def get_foot_position(self, frame_index: int) -> tuple[float, float] | None:
+        """Bottom-centre of the bounding box (more stable for ground plane)."""
+        if frame_index not in self.boxes:
+            return None
+        box = self.boxes[frame_index]
+        return (float((box[0] + box[2]) / 2), float(box[3]))
 
 
 @dataclass
 class TrackingResult:
-    """Container for all tracking results from a video analysis session."""
+    """Container for all tracking results from a video analysis."""
 
     objects: list[TrackedObject]
     total_frames: int
     fps: float
     width: int
     height: int
+    ball_possession: dict[str, int] = field(default_factory=dict)
 
     def get_objects_by_label(self, label: str) -> list[TrackedObject]:
-        """Get all tracked objects with a given label."""
         return [obj for obj in self.objects if obj.label == label]
 
     def get_ball(self) -> TrackedObject | None:
-        """Get the ball object, if tracked."""
         balls = self.get_objects_by_label("ball")
         return balls[0] if balls else None
 
     def get_object_by_id(self, object_id: int) -> TrackedObject | None:
-        """Get a tracked object by its ID."""
         for obj in self.objects:
             if obj.object_id == object_id:
                 return obj
         return None
 
     def get_player_ids(self) -> list[int]:
-        """Get all player object IDs (excludes ball)."""
         return [
             obj.object_id
             for obj in self.objects
@@ -91,280 +93,209 @@ class TrackingResult:
         ]
 
 
+# -----------------------------------------------------------------------
+# Team colour assignment (matches the reference implementation)
+# -----------------------------------------------------------------------
+
+class TeamAssigner:
+    """Assign players to teams based on jersey colour using KMeans.
+
+    Uses the top-half of each player bbox, clusters pixels into 2 groups
+    (jersey vs background), picks the jersey cluster using corner pixels,
+    then clusters all players into 2 teams.
+    """
+
+    def __init__(self):
+        self.team_kmeans = None
+        self.team_colors: dict[int, np.ndarray] = {}
+
+    def get_player_color(self, frame: np.ndarray, bbox: np.ndarray) -> np.ndarray:
+        """Extract the dominant jersey colour for one player."""
+        x1, y1, x2, y2 = map(int, bbox)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2 = min(frame.shape[1], x2)
+        y2 = min(frame.shape[0], y2)
+
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return np.zeros(3)
+
+        top_half = crop[: crop.shape[0] // 2, :]
+        if top_half.size == 0:
+            top_half = crop
+
+        hsv = cv2.cvtColor(top_half, cv2.COLOR_BGR2HSV)
+        pixels = hsv.reshape(-1, 3).astype(np.float32)
+        if len(pixels) < 4:
+            return np.zeros(3)
+
+        km = KMeans(n_clusters=2, n_init=1, random_state=42)
+        km.fit(pixels)
+
+        labels_img = km.labels_.reshape(top_half.shape[0], top_half.shape[1])
+        corners = [
+            labels_img[0, 0], labels_img[0, -1],
+            labels_img[-1, 0], labels_img[-1, -1],
+        ]
+        bg_cluster = max(set(corners), key=corners.count)
+        player_cluster = 1 - bg_cluster
+        return km.cluster_centers_[player_cluster]
+
+    def fit_teams(self, frame: np.ndarray, player_boxes: np.ndarray):
+        """Cluster all visible players into 2 teams on the first frame."""
+        colors = []
+        for bbox in player_boxes:
+            colors.append(self.get_player_color(frame, bbox))
+        if len(colors) < 2:
+            self.team_kmeans = None
+            return
+
+        self.team_kmeans = KMeans(n_clusters=2, init="k-means++", n_init="auto", random_state=42)
+        self.team_kmeans.fit(colors)
+        self.team_colors[0] = self.team_kmeans.cluster_centers_[0]
+        self.team_colors[1] = self.team_kmeans.cluster_centers_[1]
+
+    def get_team_id(self, frame: np.ndarray, bbox: np.ndarray) -> int:
+        """Return 0 or 1 for a player."""
+        if self.team_kmeans is None:
+            return 0
+        color = self.get_player_color(frame, bbox)
+        return int(self.team_kmeans.predict(color.reshape(1, -1))[0])
+
+
+# -----------------------------------------------------------------------
+# Ball-to-player assignment (distance-based, from the reference)
+# -----------------------------------------------------------------------
+
+MAX_BALL_DISTANCE = 70  # pixels
+
+def _assign_ball_to_player(
+    player_boxes: np.ndarray,
+    ball_center: tuple[float, float] | None,
+) -> int:
+    """Return the index of the closest player to the ball, or -1."""
+    if ball_center is None or len(player_boxes) == 0:
+        return -1
+
+    bx, by = ball_center
+    min_dist = MAX_BALL_DISTANCE
+    best = -1
+
+    for i, bbox in enumerate(player_boxes):
+        x1, y1, x2, y2 = bbox
+        # Distance from ball to both feet (bottom-left and bottom-right)
+        dl = np.sqrt((x1 - bx) ** 2 + (y2 - by) ** 2)
+        dr = np.sqrt((x2 - bx) ** 2 + (y2 - by) ** 2)
+        d = min(dl, dr)
+        if d < min_dist:
+            min_dist = d
+            best = i
+
+    return best
+
+
+# -----------------------------------------------------------------------
+# Ball interpolation
+# -----------------------------------------------------------------------
+
+def _interpolate_ball(
+    ball_obj: TrackedObject, total_frames: int, max_gap: int = 20
+) -> None:
+    """Fill short gaps in ball tracking via linear interpolation."""
+    if not ball_obj.boxes:
+        return
+
+    rows = []
+    for f in range(total_frames):
+        if f in ball_obj.boxes:
+            b = ball_obj.boxes[f]
+            rows.append([float(b[0]), float(b[1]), float(b[2]), float(b[3])])
+        else:
+            rows.append([None, None, None, None])
+
+    df = pd.DataFrame(rows, columns=["x1", "y1", "x2", "y2"])
+    df = df.interpolate(method="linear", limit=max_gap, limit_area="inside")
+
+    for f in range(total_frames):
+        row = df.iloc[f]
+        if row.isna().any():
+            continue
+        ball_obj.boxes[f] = np.array(
+            [row["x1"], row["y1"], row["x2"], row["y2"]], dtype=np.float32
+        )
+
+
+# -----------------------------------------------------------------------
+# Main tracker
+# -----------------------------------------------------------------------
+
 class SoccerTracker:
-    """High-level tracker using YOLOv8/Roboflow + ByteTrack + jersey color clustering.
+    """End-to-end football tracker.
 
-    Detects players and ball, tracks them with persistent IDs, and
-    automatically classifies players into two teams based on jersey color.
+    Supports two model sources:
+      - A custom-trained YOLO model (best.pt from training/train.py)
+      - The Roboflow inference model (fallback via API key)
 
-    Usage:
-        tracker = SoccerTracker()
-        result = tracker.analyze(video_path="clip.mp4", track_ball=True)
+    Usage::
+
+        tracker = SoccerTracker(model_path="models/best.pt")
+        result = tracker.analyze("clip.mp4")
     """
 
     def __init__(
         self,
+        model_path: str | None = None,
         model_name: str = "yolov8n.pt",
-        device: str | None = None,
         confidence: float = 0.3,
+        device: str | None = None,
     ):
-        """Initialize the tracker.
-
-        Args:
-            model_name: YOLOv8 model name/path (used when Roboflow is not active).
-            device: Device string ("cpu", "mps", "cuda"). Auto-detected if None.
-            confidence: Minimum detection confidence threshold (0-1).
-        """
-        self._model_name = model_name
-        self._model: YOLO | None = None
-        self._device = device
+        self._model_path = model_path  # custom-trained model
+        self._model_name = model_name  # generic YOLO fallback
         self._confidence = confidence
-
-        # Roboflow model (loaded lazily if API key provided)
+        self._device = device
+        self._model: YOLO | None = None
         self._rf_model = None
         self._use_roboflow = False
+        self._use_custom = False
 
-    # ------------------------------------------------------------------
-    # Model loading
-    # ------------------------------------------------------------------
+    # ---- model loading ----
 
     def _load_model(self):
-        """Lazily load the YOLO model."""
         if self._model is not None:
             return
-        logger.info(f"Loading YOLOv8 model: {self._model_name}")
-        self._model = YOLO(self._model_name)
-        logger.info("YOLOv8 model loaded successfully.")
+        path = self._model_path or self._model_name
+        logger.info(f"Loading YOLO model: {path}")
+        self._model = YOLO(path)
+        self._use_custom = self._model_path is not None
+        logger.info("YOLO model loaded.")
 
-    def _load_roboflow_model(self, api_key: str, model_id: str = "football-players-detection-3zvbc/11"):
-        """Load the Roboflow football-players-detection model locally.
-
-        Downloads the model weights on first run (requires API key) and
-        caches them locally.  All subsequent inference runs entirely on
-        device -- no network calls per frame.
-
-        The default model detects: ball, goalkeeper, player, referee.
-
-        Args:
-            api_key: Roboflow API key (needed for initial download).
-            model_id: Roboflow model ID in ``project/version`` format.
-        """
+    def _load_roboflow_model(self, api_key: str, model_id: str):
         if self._rf_model is not None:
             return
-
-        logger.info(f"Loading Roboflow model locally: {model_id} ...")
-        # inference reads the key from the env var
         os.environ["ROBOFLOW_API_KEY"] = api_key
-
         from inference import get_model
-
         self._rf_model = get_model(model_id=model_id)
         self._use_roboflow = True
-        logger.info("Roboflow model loaded successfully (local inference).")
+        logger.info("Roboflow model loaded (local inference).")
 
-    # ------------------------------------------------------------------
-    # Jersey color team classification
-    # ------------------------------------------------------------------
+    # ---- detection ----
 
-    @staticmethod
-    def _get_dominant_jersey_color(
-        frame: np.ndarray, box: np.ndarray
-    ) -> np.ndarray:
-        """Extract the dominant jersey color from a player bounding box.
-
-        Crops the upper 60% of the player (jersey region), converts to
-        HSV for better color discrimination, then uses K-Means to find
-        the dominant non-green color (to avoid pitch contamination).
-
-        Args:
-            frame: Full BGR frame.
-            box: [x1, y1, x2, y2] bounding box.
-
-        Returns:
-            Dominant color as a 3-element HSV numpy array.
-        """
-        x1, y1, x2, y2 = map(int, box)
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(frame.shape[1], x2)
-        y2 = min(frame.shape[0], y2)
-
-        player_crop = frame[y1:y2, x1:x2]
-        if player_crop.size == 0:
-            return np.array([0.0, 0.0, 0.0])
-
-        # Focus on upper body (jersey, not shorts/legs)
-        h = player_crop.shape[0]
-        jersey_crop = player_crop[: int(h * 0.6), :]
-        if jersey_crop.size == 0:
-            jersey_crop = player_crop
-
-        # Convert to HSV for better color clustering
-        hsv_crop = cv2.cvtColor(jersey_crop, cv2.COLOR_BGR2HSV)
-        pixels = hsv_crop.reshape(-1, 3).astype(np.float32)
-
-        if len(pixels) < 10:
-            return np.array([0.0, 0.0, 0.0])
-
-        # K-Means to find dominant colors (3 clusters)
-        n_clusters = min(3, len(pixels))
-        kmeans = KMeans(n_clusters=n_clusters, n_init=3, random_state=42)
-        kmeans.fit(pixels)
-
-        # Pick the most frequent cluster that is NOT green (pitch)
-        counts = np.bincount(kmeans.labels_, minlength=n_clusters)
-        centers = kmeans.cluster_centers_
-
-        # Sort clusters by frequency (most common first)
-        order = np.argsort(-counts)
-
-        for idx in order:
-            center = centers[idx]
-            hue = center[0]  # HSV hue: 0-180 in OpenCV
-            sat = center[1]
-
-            # Skip green-ish colors (pitch grass): hue ~35-85, sat > 40
-            is_green = 35 < hue < 85 and sat > 40
-            if not is_green:
-                return center
-
-        # Fallback: return most common cluster
-        return centers[order[0]]
-
-    @staticmethod
-    def _classify_teams(
-        jersey_colors: list[np.ndarray],
-        n_teams: int = 2,
-    ) -> list[str]:
-        """Cluster jersey colors into teams using K-Means.
-
-        Args:
-            jersey_colors: List of dominant HSV colors (one per player).
-            n_teams: Number of teams to cluster into.
-
-        Returns:
-            List of labels: "team_a" or "team_b" for each player.
-        """
-        if len(jersey_colors) < 2:
-            return ["team_a"] * len(jersey_colors)
-
-        color_array = np.array(jersey_colors, dtype=np.float32)
-
-        # Cluster into n_teams groups
-        kmeans = KMeans(n_clusters=n_teams, n_init=10, random_state=42)
-        team_labels = kmeans.fit_predict(color_array)
-
-        return ["team_a" if t == 0 else "team_b" for t in team_labels]
-
-    # ------------------------------------------------------------------
-    # Roboflow detection helpers
-    # ------------------------------------------------------------------
-
-    def _detect_roboflow(
-        self, frame: np.ndarray, conf: float
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Run detection using the local Roboflow model.
-
-        The model runs entirely on-device (no network calls).  Accepts
-        a numpy BGR array directly -- no temp-file I/O.
-
-        Args:
-            frame: BGR numpy array.
-            conf: Confidence threshold (0-1).
-
-        Returns:
-            Tuple of (player_boxes, player_confs, player_classes,
-                      ball_boxes, ball_confs, ball_classes).
-        """
-        empty_box = np.empty((0, 4), dtype=np.float32)
-        empty_conf = np.empty(0, dtype=np.float32)
-        empty_cls = np.empty(0, dtype=int)
-
-        # inference.get_model().infer() accepts numpy arrays directly
-        results = self._rf_model.infer(frame, confidence=conf)
-        if not results:
-            return empty_box, empty_conf, empty_cls, empty_box.copy(), empty_conf.copy(), empty_cls.copy()
-
-        # Convert to supervision Detections for uniform handling
-        detections = sv.Detections.from_inference(results[0])
-
-        if len(detections) == 0:
-            return empty_box, empty_conf, empty_cls, empty_box.copy(), empty_conf.copy(), empty_cls.copy()
-
-        # Class names are stored in detections.data["class_name"]
-        class_names = detections.data.get("class_name", np.array([]))
-
-        player_mask = np.array(
-            [name.lower() in RF_PLAYER_CLASSES for name in class_names],
-            dtype=bool,
-        )
-        ball_mask = np.array(
-            [name.lower() in RF_BALL_CLASSES for name in class_names],
-            dtype=bool,
-        )
-
-        if player_mask.any():
-            p_boxes = detections.xyxy[player_mask].astype(np.float32)
-            p_confs = detections.confidence[player_mask].astype(np.float32)
-            p_classes = np.zeros(int(player_mask.sum()), dtype=int)
+    def _detect(self, frame: np.ndarray, conf: float):
+        """Run detection and return sv.Detections."""
+        if self._use_roboflow:
+            results = self._rf_model.infer(frame, confidence=conf)
+            if not results:
+                return sv.Detections.empty()
+            return sv.Detections.from_inference(results[0])
         else:
-            p_boxes, p_confs, p_classes = empty_box, empty_conf, empty_cls
+            results = self._model.predict(
+                frame, conf=conf, device=self._device, verbose=False,
+            )
+            if not results or results[0].boxes is None:
+                return sv.Detections.empty()
+            return sv.Detections.from_ultralytics(results[0])
 
-        if ball_mask.any():
-            b_boxes = detections.xyxy[ball_mask].astype(np.float32)
-            b_confs = detections.confidence[ball_mask].astype(np.float32)
-            b_classes = np.ones(int(ball_mask.sum()), dtype=int)
-        else:
-            b_boxes = empty_box.copy()
-            b_confs = empty_conf.copy()
-            b_classes = empty_cls.copy()
-
-        return p_boxes, p_confs, p_classes, b_boxes, b_confs, b_classes
-
-    def _detect_yolo(
-        self, frame: np.ndarray, conf: float, classes_to_detect: list[int]
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Run detection using YOLOv8.
-
-        Returns:
-            Tuple of (player_boxes, player_confs, player_classes,
-                      ball_boxes, ball_confs, ball_classes).
-        """
-        results = self._model.predict(
-            frame,
-            conf=conf,
-            classes=classes_to_detect,
-            device=self._device,
-            verbose=False,
-        )
-
-        if not results or results[0].boxes is None:
-            empty = np.empty((0, 4), dtype=np.float32)
-            empty_c = np.empty(0, dtype=np.float32)
-            empty_cls = np.empty(0, dtype=int)
-            return empty, empty_c, empty_cls, empty.copy(), empty_c.copy(), empty_cls.copy()
-
-        result = results[0]
-        all_boxes = result.boxes.xyxy.cpu().numpy()
-        all_confs = result.boxes.conf.cpu().numpy()
-        all_classes = result.boxes.cls.cpu().numpy().astype(int)
-
-        player_mask = all_classes == PERSON_CLASS_ID
-        ball_mask = all_classes == SPORTS_BALL_CLASS_ID
-
-        p_boxes = all_boxes[player_mask] if player_mask.any() else np.empty((0, 4), dtype=np.float32)
-        p_confs = all_confs[player_mask] if player_mask.any() else np.empty(0, dtype=np.float32)
-        p_classes = all_classes[player_mask] if player_mask.any() else np.empty(0, dtype=int)
-
-        b_boxes = all_boxes[ball_mask] if ball_mask.any() else np.empty((0, 4), dtype=np.float32)
-        b_confs = all_confs[ball_mask] if ball_mask.any() else np.empty(0, dtype=np.float32)
-        b_classes = all_classes[ball_mask] if ball_mask.any() else np.empty(0, dtype=int)
-
-        return p_boxes, p_confs, p_classes, b_boxes, b_confs, b_classes
-
-    # ------------------------------------------------------------------
-    # Main analysis
-    # ------------------------------------------------------------------
+    # ---- analysis ----
 
     def analyze(
         self,
@@ -374,76 +305,60 @@ class SoccerTracker:
         confidence: float | None = None,
         roboflow_api_key: str | None = None,
         roboflow_model_id: str = "football-players-detection-3zvbc/11",
+        stride: int = 1,
         progress_callback: Any | None = None,
     ) -> TrackingResult:
-        """Run full tracking analysis on a soccer video clip.
-
-        Args:
-            video_path: Path to the video file (MP4, AVI, etc.).
-            track_ball: Whether to track the ball.
-            fps: Video FPS (auto-detected from video if None).
-            confidence: Override detection confidence for this run.
-            roboflow_api_key: If provided, use Roboflow football model
-                              (run locally) instead of generic YOLOv8.
-            roboflow_model_id: Roboflow model ID (project/version).
-            progress_callback: Optional callable(status_str) for progress updates.
-
-        Returns:
-            TrackingResult with all tracked objects and per-frame data.
-        """
-        # Load the appropriate model
-        if roboflow_api_key:
+        # Load model
+        if roboflow_api_key and not self._model_path:
             if progress_callback:
-                progress_callback("Loading Roboflow football model (local)...")
-            self._load_roboflow_model(roboflow_api_key, model_id=roboflow_model_id)
+                progress_callback("Loading Roboflow model...")
+            self._load_roboflow_model(roboflow_api_key, roboflow_model_id)
         else:
             self._load_model()
 
         conf = confidence if confidence is not None else self._confidence
 
-        # ---- Read video metadata ----
+        # Video metadata
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video: {video_path}")
-
         detected_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
-
         fps = fps or detected_fps
 
-        if progress_callback:
-            progress_callback("Initializing trackers...")
+        # Class name → ID mapping (depends on model source)
+        # For custom-trained models, class IDs are 0-3.
+        # For Roboflow inference, we use class_name strings.
 
-        # ---- Set up ByteTrack trackers ----
-        player_tracker = sv.ByteTrack(
-            track_activation_threshold=conf,
-            frame_rate=int(fps),
-        )
+        # ByteTrack trackers
+        team1_tracker = sv.ByteTrack(track_activation_threshold=conf, frame_rate=int(fps))
+        team2_tracker = sv.ByteTrack(track_activation_threshold=conf, frame_rate=int(fps))
         ball_tracker = sv.ByteTrack(
-            track_activation_threshold=max(conf - 0.1, 0.1),
-            frame_rate=int(fps),
+            track_activation_threshold=max(conf - 0.1, 0.1), frame_rate=int(fps)
         ) if track_ball else None
 
-        # COCO classes for YOLO fallback
-        classes_to_detect = [PERSON_CLASS_ID]
-        if track_ball:
-            classes_to_detect.append(SPORTS_BALL_CLASS_ID)
+        # Team assigner
+        team_assigner = TeamAssigner()
+        is_first_player_frame = True
 
-        # ---- Tracking state ----
-        tracked_map: dict[int, TrackedObject] = {}
-        ball_tracked_map: dict[int, TrackedObject] = {}
+        # Tracking state
+        team_a_map: dict[int, TrackedObject] = {}
+        team_b_map: dict[int, TrackedObject] = {}
+        ball_map: dict[int, TrackedObject] = {}
+        ref_map: dict[int, TrackedObject] = {}
+        gk_map: dict[int, TrackedObject] = {}
 
-        # Collect jersey colors per tracker_id for team classification
-        # tracker_id -> list of dominant HSV colors seen across frames
-        jersey_color_samples: dict[int, list[np.ndarray]] = {}
+        ball_possession: dict[str, int] = {"team_a": 0, "team_b": 0}
+        last_possessing_team: str | None = None
+
+        stride = max(1, stride)
 
         if progress_callback:
             progress_callback("Running detection and tracking...")
 
-        # ---- Process each frame ----
         cap = cv2.VideoCapture(video_path)
         frame_idx = 0
 
@@ -452,119 +367,154 @@ class SoccerTracker:
             if not ret:
                 break
 
+            if stride > 1 and frame_idx % stride != 0:
+                frame_idx += 1
+                continue
+
             if progress_callback and frame_idx % 30 == 0:
                 pct = int(frame_idx / max(total_frames, 1) * 100)
-                progress_callback(
-                    f"Processing frame {frame_idx}/{total_frames} ({pct}%)..."
-                )
+                progress_callback(f"Processing frame {frame_idx}/{total_frames} ({pct}%)...")
 
             # ---- Detect ----
-            if self._use_roboflow:
-                p_boxes, p_confs, p_cls, b_boxes, b_confs, b_cls = (
-                    self._detect_roboflow(frame, conf)
-                )
+            detections = self._detect(frame, conf)
+
+            if len(detections) == 0:
+                frame_idx += 1
+                continue
+
+            # ---- Split by class ----
+            class_names = detections.data.get("class_name", None)
+
+            if class_names is not None and len(class_names) > 0:
+                # Roboflow inference model (class names are strings)
+                player_mask = np.array([
+                    n.lower() in ("player", "goalkeeper") for n in class_names
+                ], dtype=bool)
+                ball_mask = np.array([
+                    n.lower() == "ball" for n in class_names
+                ], dtype=bool)
+                ref_mask = np.array([
+                    n.lower() == "referee" for n in class_names
+                ], dtype=bool)
+                gk_mask = np.array([
+                    n.lower() == "goalkeeper" for n in class_names
+                ], dtype=bool)
             else:
-                p_boxes, p_confs, p_cls, b_boxes, b_confs, b_cls = (
-                    self._detect_yolo(frame, conf, classes_to_detect)
-                )
+                # Custom-trained model (class IDs are integers)
+                cids = detections.class_id
+                player_mask = (cids == CLASS_PLAYER) | (cids == CLASS_GOALKEEPER)
+                ball_mask = cids == CLASS_BALL
+                ref_mask = cids == CLASS_REFEREE
+                gk_mask = cids == CLASS_GOALKEEPER
 
-            # ---- Track players ----
-            if len(p_boxes) > 0:
-                player_detections = sv.Detections(
-                    xyxy=p_boxes,
-                    confidence=p_confs,
-                    class_id=p_cls,
-                )
-                tracked_players = player_tracker.update_with_detections(
-                    player_detections
-                )
+            player_dets = detections[player_mask]
+            ball_dets = detections[ball_mask]
+            ref_dets = detections[ref_mask]
 
-                # Update tracking state + sample jersey colors
-                if tracked_players.tracker_id is not None:
-                    for i, tracker_id in enumerate(tracked_players.tracker_id):
-                        tid = int(tracker_id)
-                        box = tracked_players.xyxy[i]
+            # Apply NMS to players
+            if len(player_dets) > 0:
+                player_dets = player_dets.with_nms(threshold=0.5)
 
-                        if tid not in tracked_map:
-                            tracked_map[tid] = TrackedObject(
-                                object_id=tid,
-                                label="team_a",  # placeholder, assigned later
-                            )
-                        obj = tracked_map[tid]
-                        obj.boxes[frame_idx] = box.copy()
-                        if (
-                            tracked_players.confidence is not None
-                            and i < len(tracked_players.confidence)
-                        ):
-                            obj.scores[frame_idx] = float(
-                                tracked_players.confidence[i]
-                            )
+            # ---- Team assignment ----
+            if len(player_dets) > 0:
+                if is_first_player_frame and len(player_dets) >= 2:
+                    team_assigner.fit_teams(frame, player_dets.xyxy)
+                    is_first_player_frame = False
 
-                        # Sample jersey color (every 10 frames to save compute)
-                        if frame_idx % 10 == 0:
-                            color = self._get_dominant_jersey_color(frame, box)
-                            if tid not in jersey_color_samples:
-                                jersey_color_samples[tid] = []
-                            jersey_color_samples[tid].append(color)
+                if team_assigner.team_kmeans is not None:
+                    team1_indices = []
+                    team2_indices = []
+                    for i in range(len(player_dets)):
+                        tid = team_assigner.get_team_id(frame, player_dets.xyxy[i])
+                        if tid == 0:
+                            team1_indices.append(i)
+                        else:
+                            team2_indices.append(i)
 
-            # ---- Track ball ----
-            if track_ball and ball_tracker is not None and len(b_boxes) > 0:
-                ball_detections = sv.Detections(
-                    xyxy=b_boxes,
-                    confidence=b_confs,
-                    class_id=b_cls,
-                )
-                tracked_balls = ball_tracker.update_with_detections(
-                    ball_detections
-                )
-                self._update_tracked_objects(
-                    ball_tracked_map, tracked_balls, frame_idx, label="ball"
-                )
+                    t1_dets = player_dets[team1_indices] if team1_indices else sv.Detections.empty()
+                    t2_dets = player_dets[team2_indices] if team2_indices else sv.Detections.empty()
+                else:
+                    t1_dets = player_dets
+                    t2_dets = sv.Detections.empty()
+            else:
+                t1_dets = sv.Detections.empty()
+                t2_dets = sv.Detections.empty()
+
+            # ---- Track ----
+            if len(t1_dets) > 0:
+                t1_tracked = team1_tracker.update_with_detections(t1_dets)
+                self._store_tracked(team_a_map, t1_tracked, frame_idx, "team_a")
+            if len(t2_dets) > 0:
+                t2_tracked = team2_tracker.update_with_detections(t2_dets)
+                self._store_tracked(team_b_map, t2_tracked, frame_idx, "team_b")
+            if track_ball and ball_tracker and len(ball_dets) > 0:
+                b_tracked = ball_tracker.update_with_detections(ball_dets)
+                self._store_tracked(ball_map, b_tracked, frame_idx, "ball")
+            if len(ref_dets) > 0:
+                # Store referee directly (no separate tracker needed for small count)
+                for i in range(len(ref_dets)):
+                    rid = i  # simple indexing per frame
+                    if rid not in ref_map:
+                        ref_map[rid] = TrackedObject(object_id=rid, label="referee")
+                    ref_map[rid].boxes[frame_idx] = ref_dets.xyxy[i].copy()
+
+            # ---- Ball-to-player assignment ----
+            ball_center = None
+            if track_ball and len(ball_dets) > 0:
+                bx = ball_dets.xyxy[0]
+                ball_center = (float((bx[0] + bx[2]) / 2), float((bx[1] + bx[3]) / 2))
+
+            if ball_center is not None and len(player_dets) > 0:
+                idx = _assign_ball_to_player(player_dets.xyxy, ball_center)
+                if idx != -1:
+                    # Determine which team this player belongs to
+                    if team_assigner.team_kmeans is not None:
+                        tid = team_assigner.get_team_id(frame, player_dets.xyxy[idx])
+                        team_key = "team_a" if tid == 0 else "team_b"
+                    else:
+                        team_key = "team_a"
+                    ball_possession[team_key] += 1
+                    last_possessing_team = team_key
+                elif last_possessing_team:
+                    ball_possession[last_possessing_team] += 1
+            elif last_possessing_team:
+                ball_possession[last_possessing_team] += 1
 
             frame_idx += 1
 
         cap.release()
 
-        # ---- Classify teams by jersey color ----
-        if progress_callback:
-            progress_callback("Classifying teams by jersey color...")
-
-        # Compute average jersey color per player
-        avg_colors: dict[int, np.ndarray] = {}
-        for tid, samples in jersey_color_samples.items():
-            if samples:
-                avg_colors[tid] = np.mean(samples, axis=0)
-
-        # Get ordered list of tracker IDs that have color samples
-        tids_with_color = [tid for tid in tracked_map if tid in avg_colors]
-        if tids_with_color:
-            color_list = [avg_colors[tid] for tid in tids_with_color]
-            team_labels = self._classify_teams(color_list, n_teams=2)
-
-            for tid, team_label in zip(tids_with_color, team_labels):
-                tracked_map[tid].label = team_label
-
-        # Players without enough color samples default to team_a
-        for tid, obj in tracked_map.items():
-            if tid not in avg_colors:
-                obj.label = "team_a"
+        # ---- Ball interpolation ----
+        if track_ball and ball_map:
+            if progress_callback:
+                progress_callback("Interpolating ball positions...")
+            best_tid = max(ball_map, key=lambda t: len(ball_map[t].boxes))
+            best_ball = ball_map[best_tid]
+            _interpolate_ball(best_ball, frame_idx)
+            ball_map = {best_tid: best_ball}
 
         if progress_callback:
             progress_callback("Tracking complete!")
 
-        # ---- Build final object list with unique IDs ----
+        # ---- Build final object list ----
         all_objects: list[TrackedObject] = []
-        next_id = 0
-
-        for obj in tracked_map.values():
-            obj.object_id = next_id
+        nid = 0
+        for obj in team_a_map.values():
+            obj.object_id = nid
             all_objects.append(obj)
-            next_id += 1
-
-        for obj in ball_tracked_map.values():
-            obj.object_id = next_id
+            nid += 1
+        for obj in team_b_map.values():
+            obj.object_id = nid
             all_objects.append(obj)
-            next_id += 1
+            nid += 1
+        for obj in ball_map.values():
+            obj.object_id = nid
+            all_objects.append(obj)
+            nid += 1
+        for obj in ref_map.values():
+            obj.object_id = nid
+            all_objects.append(obj)
+            nid += 1
 
         return TrackingResult(
             objects=all_objects,
@@ -572,37 +522,23 @@ class SoccerTracker:
             fps=fps,
             width=width,
             height=height,
+            ball_possession=ball_possession,
         )
 
     @staticmethod
-    def _update_tracked_objects(
+    def _store_tracked(
         tracked_map: dict[int, TrackedObject],
         detections: sv.Detections,
         frame_idx: int,
         label: str,
     ):
-        """Update the tracked objects map with new detections for a frame.
-
-        Args:
-            tracked_map: Dict mapping tracker_id -> TrackedObject.
-            detections: Supervision Detections with tracker_id set.
-            frame_idx: Current frame index.
-            label: Label for new objects.
-        """
         if detections.tracker_id is None:
             return
-
-        for i, tracker_id in enumerate(detections.tracker_id):
-            tid = int(tracker_id)
-
+        for i, tid in enumerate(detections.tracker_id):
+            tid = int(tid)
             if tid not in tracked_map:
-                tracked_map[tid] = TrackedObject(
-                    object_id=tid,
-                    label=label,
-                )
-
+                tracked_map[tid] = TrackedObject(object_id=tid, label=label)
             obj = tracked_map[tid]
             obj.boxes[frame_idx] = detections.xyxy[i].copy()
-
             if detections.confidence is not None and i < len(detections.confidence):
                 obj.scores[frame_idx] = float(detections.confidence[i])
